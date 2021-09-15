@@ -1,0 +1,144 @@
+---
+title: 'Divvy Bikes Analysis'
+author: "Dan McDonough"
+date: "September 14, 2021"
+output: html_document
+---
+
+For this analysis, I've used the popular Divvy Bike data set made available by the city of Chicago: https://divvy-tripdata.s3.amazonaws.com/index.html.
+
+The purpose of the analysis is to forecast ridership.
+
+### Data Prep
+
+I will analyze 2017-2018 bike rides and predict rides in 2019.
+
+``` {r 1, message=FALSE, warning=FALSE}
+library(dplyr)
+library(forecast)
+library(TSPred)
+library(aTSA)
+library(fGarch)
+library(prophet)
+
+datapath <- 'C:/Users/Dan/Desktop/Documents/Misc Documents/Other/Code Projects/divvy/'
+
+# some prepocessing of the individual data files has been removed for readability
+df <- read.csv(paste0(datapath,'bikes.csv'))
+
+train <- df[df$Year<2019,]
+test <- df[df$Year==2019,]
+
+rm(df)
+gc()
+
+daily_df <- as.data.frame(train%>%group_by(Year,startmonth,startday)%>%summarise(trips=n()))
+daily_test_df <- as.data.frame(test%>%group_by(Year,startmonth,startday)%>%summarise(trips=n()))
+
+head(daily_df,10)
+```
+
+There is no surprise to see a very clear annual seasonal trend for riding a divvy bike in Chicago.
+
+```{r 2, echo=FALSE}
+plot1 <- train%>%group_by(startmonth)%>%summarise(trips=n())
+
+plot(plot1$trips,col='cadetblue3',type='b',pch=16,lwd=2,
+     main='Annual Seasonality in Transporation',xlab='Month',ylab='Rides',
+     xaxt='none',yaxt='none')
+axis(1,1:12)
+axis(2,seq(0,10000,5000))
+
+```
+
+What's also interesting is that there appears to be a clear weekly commuter trend as well.
+
+```{r 3, echo=FALSE}
+plot2 <- train%>%group_by(startweekday)%>%summarise(trips=n())
+
+plot(plot2$trips,col='cadetblue3',type='b',pch=16,lwd=2,
+     main='Weekly Seasonality in Transporation',xlab='Day',ylab='Rides',
+     xaxt='none',yaxt='none')
+axis(1,1:7)
+axis(2,seq(0,10000,1000))
+```
+
+### Models
+
+I started with some ARIMA modeling. The model was unable to pick up on either of the seasonal trends, and did not provide a useful prediction.  
+
+``` {r 4}
+model <- auto.arima(daily_df$trips)
+
+pred <- as.data.frame(forecast::forecast(model,h=365))$`Point Forecast`
+act <- daily_test_df$trips
+
+plot(act,col='blue',type='b')
+points(pred,col='red',type='b')
+
+round(sMAPE(act[1:365],pred),2)
+```
+
+Next I ran a holt winters model, which captured the weekly seasonality but failed to capture the annual component.
+
+```{r 5}
+model <- HoltWinters(ts(daily_df$trips,frequency=7))
+
+pred <- as.data.frame(forecast::forecast(model,h=365))$`Point Forecast`
+act <- daily_test_df$trips
+
+plot(act,col='blue',type='b')
+points(pred,col='red',type='b')
+
+round(sMAPE(act[1:365],pred),2)
+```
+
+After this is the ARFIMA model, which appears to mistake the annual seasonality for a positive trend.
+
+``` {r 6}
+model <- arfima(daily_df$trips)
+
+pred <- as.data.frame(forecast::forecast(model,h=365))$`Point Forecast`
+act <- daily_test_df$trips
+
+plot(act,col='blue',type='b')
+points(pred,col='red',type='b')
+
+round(sMAPE(act[1:365],pred),2)
+```
+
+After these models, I switched to Facebook's prophet model. By specifying model parameters to capture both annual and weekly seasonality, this model has done the best job so far in capturing the complexity of the data.
+
+``` {r 7, warning=FALSE}
+daily_df$date <- ISOdate(daily_df$Year, daily_df$startmonth,
+                              daily_df$startday, 0, 0, 0)
+daily_test_df$date <- ISOdate(daily_test_df$Year, daily_test_df$startmonth,
+                              daily_test_df$startday, 0, 0, 0)
+
+data <- daily_df[,c('date','trips')]
+names(data) <- c('ds','y')
+m <- prophet(data, yearly.seasonality = TRUE, weekly.seasonality = TRUE)
+future <- make_future_dataframe(m, periods = 365)
+forecast <- predict(m, future)
+plot(m, forecast)
+prophet_plot_components(m, forecast)
+round(sMAPE(daily_test_df$trips,forecast[731:1095,]$yhat),2)
+```
+
+Lastly, I also ran a TBATS model. This model did the best of all and is ideal for picking up multiple seasonalities in time series data.
+
+``` {r 8}
+model <- tbats(daily_df$trips,seasonal.periods = c(7,365.25))
+
+pred <- as.data.frame(forecast::forecast(model,h=365))$`Point Forecast`
+act <- daily_test_df$trips
+
+plot(act,col='blue',type='b')
+points(pred,col='red',type='b')
+
+round(sMAPE(act[1:365],pred),2)
+```
+
+### Conclusion
+
+Initally, I envisioned creating model subgroups based on a segmentation of divvy stations, but the submodels failed to outperform the aggregated models, so the overall TBATS model provided the best results. It is worth noting though, that part of TBATS outperforming prophet is the reversal of annual trend going into 2019. Had the trend continued from 2017 into 2018, prophet may have had the best results.
